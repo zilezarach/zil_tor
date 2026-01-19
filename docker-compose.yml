@@ -1,0 +1,49 @@
+services:
+  # Go Torrent API
+  zil_tor-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zil_tor-api
+    restart: unless-stopped
+    ports:
+      - "9117:9117"
+    environment:
+      - PORT=9117
+      - CACHE_ENABLED=true
+      - SOLVER_ENABLED=true
+      - FLARESOLVERR_URL=http://flaresolverr:8191
+      - LOG_LEVEL=info
+    depends_on:
+      - flaresolverr
+    networks:
+      - torrent-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9117/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # FlareSolverr for bypassing Cloudflare
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    ports:
+      - "8191:8191"
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+      - TZ=Africa/Nairobi
+    networks:
+      - torrent-network
+
+networks:
+  torrent-network:
+    driver: bridge
+
+volumes:
+  downloads:
+    driver: local
