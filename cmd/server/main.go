@@ -1010,18 +1010,17 @@ func (s *Server) handleRepacksSearch(c *gin.Context) {
 func (s *Server) handleBooksDownloadUnified(c *gin.Context) {
 	md5 := c.Query("md5")
 	if md5 == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "md5 parameter required",
-		})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "md5 parameter required"})
 		return
 	}
 
-	source := c.Query("source") // "libgen", "annas", or "auto" (default)
+	preferredSource := strings.ToLower(c.Query("source"))
+	sourceHint := strings.ToLower(c.Query("source_hint"))
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
 	defer cancel()
 
-	// Check cache first
+	// Cache check (unchanged)
 	if cached, ok := s.downloadCache.Load(md5); ok {
 		cachedDL := cached.(*CachedDownload)
 		if time.Since(cachedDL.Created) < 30*time.Minute {
@@ -1041,38 +1040,45 @@ func (s *Server) handleBooksDownloadUnified(c *gin.Context) {
 	var sourceUsed string
 	var err error
 
-	switch strings.ToLower(source) {
-	case "libgen":
+	// Priority order:
+	// 1. Explicit ?source=libgen or ?source=annas
+	// 2. ?source_hint=annasarchive or libgen (from search result)
+	// 3. auto fallback (LibGen → Annas)
+
+	switch {
+	case preferredSource == "libgen":
 		downloadURL, err = s.getLibGenDownload(ctx, md5)
 		sourceUsed = "LibGen"
-	case "annas", "anna":
+	case preferredSource == "annas" || preferredSource == "anna":
 		downloadURL, err = s.getAnnasDownload(ctx, md5)
 		sourceUsed = "AnnasArchive"
-	case "auto", "":
-		// Try LibGen first (faster), fallback to Anna's
+	case sourceHint == "annasarchive" || sourceHint == "annas":
+
+		downloadURL, err = s.getAnnasDownload(ctx, md5)
+		sourceUsed = "AnnasArchive"
+	case sourceHint == "libgen":
 		downloadURL, err = s.getLibGenDownload(ctx, md5)
-		if err != nil {
-			s.logger.Info("LibGen failed, trying Anna's Archive", zap.Error(err))
+		sourceUsed = "LibGen"
+	default: // true auto, or no hint
+
+		downloadURL, err = s.getLibGenDownload(ctx, md5)
+		if err == nil {
+			sourceUsed = "LibGen"
+		} else {
+			s.logger.Info("LibGen failed in auto mode, falling back to Anna's", zap.Error(err))
 			downloadURL, err = s.getAnnasDownload(ctx, md5)
 			sourceUsed = "AnnasArchive"
-		} else {
-			sourceUsed = "LibGen"
 		}
-	default:
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Invalid source. Use 'libgen', 'annas', or 'auto'",
-		})
-		return
 	}
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": fmt.Sprintf("Failed to get download URL: %v", err),
+			"error": fmt.Sprintf("Failed to get download URL from %s: %v", sourceUsed, err),
 		})
 		return
 	}
 
-	// Cache the result
+	// Cache it
 	s.downloadCache.Store(md5, &CachedDownload{
 		URL:     downloadURL,
 		Created: time.Now(),
