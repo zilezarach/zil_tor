@@ -199,6 +199,7 @@ func (s *Server) SetupRoutes() {
 		// Aggregator use Both Source
 		books.GET("/search", s.handleBooksSearch)
 		books.GET("/download", s.handleBooksDownloadUnified)
+		books.GET("/search/source", s.handleBooksSearchBySource)
 	}
 	movies := api.Group("/movies")
 	{
@@ -751,6 +752,39 @@ func sanitizeFilename(name string) string {
 	}
 
 	return name
+}
+
+func (s *Server) handleBooksSearchBySource(c *gin.Context) {
+	query := c.Query("query")
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "query parameter required",
+		})
+		return
+	}
+
+	source := c.Query("source") // "libgen", "annas", or "both" (default)
+	limit := 25
+	if l := c.Query("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+		if limit > 100 {
+			limit = 100
+		}
+	}
+
+	// Route to appropriate handler based on source
+	switch strings.ToLower(source) {
+	case "libgen":
+		s.handleLibGenSearch(c)
+	case "annas", "anna", "annasarchive":
+		s.handleAnnasArchiveSearch(c)
+	case "both", "all", "":
+		s.handleBooksSearch(c)
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid source. Use 'libgen', 'annas', or 'both'",
+		})
+	}
 }
 
 // LibGen Mirrors Handler
