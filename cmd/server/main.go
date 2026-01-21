@@ -198,6 +198,7 @@ func (s *Server) SetupRoutes() {
 		books.GET("/annas/download/proxy", s.handleAnnasArchiveProxyDownload)
 		// Aggregator use Both Source
 		books.GET("/search", s.handleBooksSearch)
+		books.GET("/download", s.handleBooksDownloadUnified)
 	}
 	movies := api.Group("/movies")
 	{
@@ -969,6 +970,128 @@ func (s *Server) handleRepacksSearch(c *gin.Context) {
 	} else {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Repack aggregator not initialized"})
 	}
+}
+
+// Unifued download handler for both LibGen and Anna's Archive
+func (s *Server) handleBooksDownloadUnified(c *gin.Context) {
+	md5 := c.Query("md5")
+	if md5 == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "md5 parameter required",
+		})
+		return
+	}
+
+	source := c.Query("source") // "libgen", "annas", or "auto" (default)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+
+	// Check cache first
+	if cached, ok := s.downloadCache.Load(md5); ok {
+		cachedDL := cached.(*CachedDownload)
+		if time.Since(cachedDL.Created) < 30*time.Minute {
+			s.logger.Debug("Download URL cache hit", zap.String("md5", md5))
+			c.JSON(http.StatusOK, gin.H{
+				"md5":          md5,
+				"download_url": cachedDL.URL,
+				"source":       "cached",
+				"cached":       true,
+			})
+			return
+		}
+		s.downloadCache.Delete(md5)
+	}
+
+	var downloadURL string
+	var sourceUsed string
+	var err error
+
+	switch strings.ToLower(source) {
+	case "libgen":
+		downloadURL, err = s.getLibGenDownload(ctx, md5)
+		sourceUsed = "LibGen"
+	case "annas", "anna":
+		downloadURL, err = s.getAnnasDownload(ctx, md5)
+		sourceUsed = "AnnasArchive"
+	case "auto", "":
+		// Try LibGen first (faster), fallback to Anna's
+		downloadURL, err = s.getLibGenDownload(ctx, md5)
+		if err != nil {
+			s.logger.Info("LibGen failed, trying Anna's Archive", zap.Error(err))
+			downloadURL, err = s.getAnnasDownload(ctx, md5)
+			sourceUsed = "AnnasArchive"
+		} else {
+			sourceUsed = "LibGen"
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid source. Use 'libgen', 'annas', or 'auto'",
+		})
+		return
+	}
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to get download URL: %v", err),
+		})
+		return
+	}
+
+	// Cache the result
+	s.downloadCache.Store(md5, &CachedDownload{
+		URL:     downloadURL,
+		Created: time.Now(),
+		MD5:     md5,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"md5":          md5,
+		"download_url": downloadURL,
+		"source":       sourceUsed,
+		"cached":       false,
+	})
+}
+
+// Helper functions for unified download
+func (s *Server) getLibGenDownload(ctx context.Context, md5 string) (string, error) {
+	libgenIndexer, ok := s.indexers["libgen"]
+	if !ok {
+		return "", fmt.Errorf("LibGen indexer not available")
+	}
+
+	scraper, ok := libgenIndexer.(*libgen.LibGenScraperIndexer)
+	if !ok {
+		return "", fmt.Errorf("LibGen indexer type mismatch")
+	}
+
+	mirrors := scraper.GetMirrors()
+	if len(mirrors) == 0 {
+		return "", fmt.Errorf("no LibGen mirrors available")
+	}
+
+	return scraper.GetCachedDownloadURL(ctx, mirrors[0].URL, md5)
+}
+
+func (s *Server) getAnnasDownload(ctx context.Context, md5 string) (string, error) {
+	annasIndexer, ok := s.indexers["annas"]
+	if !ok {
+		return "", fmt.Errorf("Anna's Archive indexer not available")
+	}
+
+	scraper := annasIndexer.(*annasarchive.AnnasArchiveIndexer)
+
+	bookURL := fmt.Sprintf("https://annas-archive.li/md5/%s", md5)
+	bookInfo, err := scraper.GetBookInfo(ctx, bookURL)
+	if err != nil {
+		return "", err
+	}
+
+	if bookInfo.Mirror == "" {
+		return "", fmt.Errorf("no download mirror found")
+	}
+
+	return s.solveAnnasArchiveDownload(ctx, bookInfo.Mirror)
 }
 
 // handleRepacksLatest handles fetching the combined latest releases
