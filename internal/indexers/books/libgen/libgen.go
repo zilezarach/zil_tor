@@ -55,7 +55,7 @@ type DownloadProgress struct {
 	TotalBytes      int64
 	DownloadedBytes int64
 	StartTime       time.Time
-	Speed           float64
+	Speed           float64 // bytes per second
 }
 
 // NewLibGenScraperIndexer creates a new LibGen scraper with download worker pool

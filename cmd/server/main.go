@@ -14,10 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/gin-gonic/gin"
 	"github.com/zilezarach/zil_tor-api/internal/bypass"
 	"github.com/zilezarach/zil_tor-api/internal/cache"
 	"github.com/zilezarach/zil_tor-api/internal/indexers"
+	"github.com/zilezarach/zil_tor-api/internal/indexers/books/annasarchive"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/books/libgen"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games/dodi"
@@ -50,9 +52,15 @@ type Server struct {
 	solver       *bypass.Solver
 	solverClient *bypass.HybridClient
 	indexers     map[string]indexers.Indexer
-
 	// Worker pool for concurrent searches
-	workerPool chan struct{}
+	workerPool    chan struct{}
+	downloadCache *sync.Map
+}
+
+type CachedDownload struct {
+	URL     string
+	Created time.Time
+	MD5     string
 }
 
 func main() {
@@ -110,11 +118,12 @@ func NewServer(config *Config, logger *zap.Logger) *Server {
 	gin.SetMode(gin.ReleaseMode)
 
 	server := &Server{
-		router:     gin.New(),
-		config:     config,
-		logger:     logger,
-		indexers:   make(map[string]indexers.Indexer),
-		workerPool: make(chan struct{}, config.MaxConcurrency),
+		router:        gin.New(),
+		config:        config,
+		logger:        logger,
+		indexers:      make(map[string]indexers.Indexer),
+		workerPool:    make(chan struct{}, config.MaxConcurrency),
+		downloadCache: &sync.Map{},
 	}
 
 	// Middleware
@@ -182,6 +191,11 @@ func (s *Server) SetupRoutes() {
 		books.GET("/libgen/mirrors", s.handleLibGenMirrors)
 		books.GET("/libgen/health", s.handleLibGenHealth)
 		books.GET("/libgen/download", s.handleDirectDownload)
+		// AnnasArchive
+		books.GET("/annas/search", s.handleAnnasArchiveSearch)
+		books.GET("/annas/info", s.handleAnnasArchiveInfo)
+		books.GET("/annas/download", s.handleAnnasArchiveDownload)
+		books.GET("/annas/download/proxy", s.handleAnnasArchiveProxyDownload)
 	}
 }
 
@@ -193,7 +207,9 @@ func (s *Server) RegisterIndexers(solverClient *bypass.HybridClient) {
 	s.indexers["Fitgirl"] = fitgirl.FitgirlGenIndexer(solverClient, s.logger)
 	s.logger.Info("Fitgirl Indexers Loaded")
 	s.indexers["DODI"] = dodi.DODIGenIndexer(solverClient, s.logger)
-	s.logger.Info("DODI Indexers Loaded")
+	s.logger.Info("Dodi indexers added")
+	s.indexers["annas"] = annasarchive.NewAnnasArchiveIndexer(s.logger)
+	s.logger.Info("Anna indexers Loaded")
 	s.indexers["Repacks"] = games.NewRepackAggregator(solverClient, s.logger)
 	libgenScraper := libgen.NewLibGenScraperIndexer(s.logger)
 	if err := libgen.UpdateLibGenScraperWithConfig(libgenScraper); err != nil {
@@ -285,6 +301,367 @@ func (s *Server) handleLibGenSearch(c *gin.Context) {
 		"source":         "LibGen",
 		"cached":         false,
 	})
+}
+
+// Annas's Archive handler
+func (s *Server) handleAnnasArchiveSearch(c *gin.Context) {
+	query := c.Query("query")
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "query parameter required",
+			"example": "/api/v1/books/annas/search?query=golang&limit=10",
+		})
+		return
+	}
+
+	limit := 25
+	if l := c.Query("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+		if limit > 100 {
+			limit = 100
+		}
+	}
+
+	annasIndexer, ok := s.indexers["annas"]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Anna's Archive indexer not available",
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	results, err := annasIndexer.Search(ctx, query, limit)
+	searchTime := time.Since(start).Seconds() * 1000
+
+	if err != nil {
+		s.logger.Error("Anna's Archive search failed",
+			zap.String("query", query),
+			zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Search failed: %v", err),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"query":          query,
+		"results":        results,
+		"count":          len(results),
+		"search_time_ms": searchTime,
+		"source":         "AnnasArchive",
+	})
+}
+
+func (s *Server) handleAnnasArchiveInfo(c *gin.Context) {
+	md5 := c.Query("md5")
+	if md5 == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "md5 parameter required",
+		})
+		return
+	}
+
+	annasIndexer, ok := s.indexers["annas"]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Anna's Archive indexer not available",
+		})
+		return
+	}
+
+	scraper := annasIndexer.(*annasarchive.AnnasArchiveIndexer)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	bookURL := fmt.Sprintf("https://annas-archive.li/md5/%s", md5)
+	bookInfo, err := scraper.GetBookInfo(ctx, bookURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to get book info: %v", err),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, bookInfo)
+}
+
+func (s *Server) handleAnnasArchiveDownload(c *gin.Context) {
+	md5 := c.Query("md5")
+	if md5 == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "md5 parameter required",
+		})
+		return
+	}
+
+	// Check cache first
+	if cached, ok := s.downloadCache.Load(md5); ok {
+		cachedDL := cached.(*CachedDownload)
+		// Cache valid for 30 minutes
+		if time.Since(cachedDL.Created) < 30*time.Minute {
+			s.logger.Debug("Download URL cache hit", zap.String("md5", md5))
+			c.JSON(http.StatusOK, gin.H{
+				"md5":          md5,
+				"download_url": cachedDL.URL,
+				"cached":       true,
+			})
+			return
+		}
+		// Expired, remove from cache
+		s.downloadCache.Delete(md5)
+	}
+
+	annasIndexer, ok := s.indexers["annas"]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Anna's Archive indexer not available",
+		})
+		return
+	}
+
+	scraper := annasIndexer.(*annasarchive.AnnasArchiveIndexer)
+
+	// Get book info to find the slow_download mirror
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+
+	bookURL := fmt.Sprintf("https://annas-archive.li/md5/%s", md5)
+	bookInfo, err := scraper.GetBookInfo(ctx, bookURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to get book info: %v", err),
+		})
+		return
+	}
+
+	if bookInfo.Mirror == "" {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "No download mirror found",
+		})
+		return
+	}
+	if bookInfo.Mirror == "" {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "No download mirror found",
+		})
+		return
+	}
+
+	s.logger.Info("Solving DDOS-Guard for Anna's Archive",
+		zap.String("md5", md5),
+		zap.String("mirror", bookInfo.Mirror))
+
+	// Use the solver to bypass DDOS-Guard and get the real download URL
+	finalDownloadURL, err := s.solveAnnasArchiveDownload(ctx, bookInfo.Mirror)
+	if err != nil {
+		s.logger.Error("Failed to solve DDOS-Guard",
+			zap.String("md5", md5),
+			zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to bypass protection: %v", err),
+		})
+		return
+	}
+
+	s.downloadCache.Store(md5, &CachedDownload{
+		URL:     finalDownloadURL,
+		Created: time.Now(),
+		MD5:     md5,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"md5":          md5,
+		"format":       bookInfo.Format,
+		"mirror":       bookInfo.Mirror,
+		"download_url": finalDownloadURL,
+		"title":        bookInfo.Title,
+		"cached":       false,
+	})
+}
+
+func (s *Server) solveAnnasArchiveDownload(ctx context.Context, mirrorURL string) (string, error) {
+	if s.solverClient == nil {
+		return "", fmt.Errorf("solver not configured")
+	}
+
+	start := time.Now()
+	s.logger.Info("Starting DDOS-Guard bypass", zap.String("url", mirrorURL))
+
+	// Use FlareSolverr to solve the challenge
+	doc, err := s.solverClient.GetDocument(ctx, mirrorURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to solve challenge: %w", err)
+	}
+
+	// Extract the download link from the solved page
+	// Looking for: <a href="https://b4mcx2ml.net/d3/y/..." target="_blank">📚 Download now</a>
+	downloadURL := ""
+	doc.Find("a[target='_blank']").Each(func(i int, sel *goquery.Selection) {
+		href, exists := sel.Attr("href")
+		text := strings.TrimSpace(sel.Text())
+
+		// Check if this is the download link
+		if exists && (strings.Contains(text, "Download") || strings.Contains(text, "📚")) {
+			// Validate it's a real download URL (not a relative link)
+			if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") {
+				downloadURL = href
+				return
+			}
+		}
+	})
+
+	if downloadURL == "" {
+		// Fallback: try to find any link containing the file extension
+		doc.Find("a[href*='.epub'], a[href*='.pdf'], a[href*='.mobi']").Each(func(i int, sel *goquery.Selection) {
+			if href, exists := sel.Attr("href"); exists {
+				if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") {
+					downloadURL = href
+					return
+				}
+			}
+		})
+	}
+
+	if downloadURL == "" {
+		return "", fmt.Errorf("download link not found in solved page")
+	}
+
+	s.logger.Info("✅ DDOS-Guard bypassed",
+		zap.String("download_url", downloadURL),
+		zap.Duration("time", time.Since(start)))
+
+	return downloadURL, nil
+}
+
+func (s *Server) handleAnnasArchiveProxyDownload(c *gin.Context) {
+	md5 := c.Query("md5")
+	if md5 == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "md5 parameter required",
+		})
+		return
+	}
+
+	annasIndexer, ok := s.indexers["annas"]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Anna's Archive indexer not available",
+		})
+		return
+	}
+
+	scraper := annasIndexer.(*annasarchive.AnnasArchiveIndexer)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 120*time.Second)
+	defer cancel()
+
+	// Get book info
+	bookURL := fmt.Sprintf("https://annas-archive.li/md5/%s", md5)
+	bookInfo, err := scraper.GetBookInfo(ctx, bookURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to get book info: %v", err),
+		})
+		return
+	}
+
+	// Solve DDOS-Guard
+	finalDownloadURL, err := s.solveAnnasArchiveDownload(ctx, bookInfo.Mirror)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to bypass protection: %v", err),
+		})
+		return
+	}
+
+	// Proxy the actual file download
+	req, err := http.NewRequestWithContext(ctx, "GET", finalDownloadURL, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "failed to create download request",
+		})
+		return
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("download failed: %v", err),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": fmt.Sprintf("upstream returned status %d", resp.StatusCode),
+		})
+		return
+	}
+
+	// Set headers for download
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		c.Header("Content-Type", contentType)
+	} else {
+		// Default based on format
+		switch strings.ToLower(bookInfo.Format) {
+		case "epub":
+			c.Header("Content-Type", "application/epub+zip")
+		case "pdf":
+			c.Header("Content-Type", "application/pdf")
+		case "mobi":
+			c.Header("Content-Type", "application/x-mobipocket-ebook")
+		default:
+			c.Header("Content-Type", "application/octet-stream")
+		}
+	}
+
+	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
+		c.Header("Content-Length", contentLength)
+	}
+
+	// Generate filename
+	filename := fmt.Sprintf("%s.%s", sanitizeFilename(bookInfo.Title), bookInfo.Format)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+
+	// Stream the file
+	written, err := io.Copy(c.Writer, resp.Body)
+	if err != nil {
+		s.logger.Error("Failed to stream download", zap.Error(err))
+		return
+	}
+
+	s.logger.Info("Anna's Archive download completed",
+		zap.String("md5", md5),
+		zap.Int64("bytes", written))
+}
+
+// sanitizeFilename removes invalid characters from filenames
+func sanitizeFilename(name string) string {
+	// Remove invalid characters
+	name = strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '_'
+		default:
+			return r
+		}
+	}, name)
+
+	// Limit length
+	if len(name) > 200 {
+		name = name[:200]
+	}
+
+	return name
 }
 
 // LibGen Mirrors Handler
