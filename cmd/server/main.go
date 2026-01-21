@@ -19,13 +19,14 @@ import (
 	"github.com/zilezarach/zil_tor-api/internal/bypass"
 	"github.com/zilezarach/zil_tor-api/internal/cache"
 	"github.com/zilezarach/zil_tor-api/internal/indexers"
+	"github.com/zilezarach/zil_tor-api/internal/indexers/books"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/books/annasarchive"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/books/libgen"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games/dodi"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games/fitgirl"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/general/x1337"
-	"github.com/zilezarach/zil_tor-api/internal/indexers/general/yts"
+	"github.com/zilezarach/zil_tor-api/internal/indexers/movies/yts"
 	"github.com/zilezarach/zil_tor-api/internal/logger"
 	"github.com/zilezarach/zil_tor-api/internal/models"
 	"go.uber.org/zap"
@@ -186,8 +187,7 @@ func (s *Server) SetupRoutes() {
 	}
 	books := api.Group("/books")
 	{
-		books.GET("/search", s.handleLibGenSearch)
-		books.GET("/libgen/search", s.handleLibGenSearch)
+		books.GET("libgen/search", s.handleLibGenSearch)
 		books.GET("/libgen/mirrors", s.handleLibGenMirrors)
 		books.GET("/libgen/health", s.handleLibGenHealth)
 		books.GET("/libgen/download", s.handleDirectDownload)
@@ -196,6 +196,13 @@ func (s *Server) SetupRoutes() {
 		books.GET("/annas/info", s.handleAnnasArchiveInfo)
 		books.GET("/annas/download", s.handleAnnasArchiveDownload)
 		books.GET("/annas/download/proxy", s.handleAnnasArchiveProxyDownload)
+		// Aggregator use Both Source
+		books.GET("/search", s.handleBooksSearch)
+	}
+	movies := api.Group("/movies")
+	{
+		// YTS
+		movies.GET("/search", s.handleYTSSearch)
 	}
 }
 
@@ -215,10 +222,47 @@ func (s *Server) RegisterIndexers(solverClient *bypass.HybridClient) {
 	if err := libgen.UpdateLibGenScraperWithConfig(libgenScraper); err != nil {
 		s.logger.Warn("Failed to update LibGen mirrors, using defaults", zap.Error(err))
 	}
-
 	s.indexers["libgen"] = libgenScraper
 	s.logger.Info("Libgen Indexers Loaded")
+	bookComb := books.NewBookAggregator(s.logger)
+	s.indexers["Books"] = bookComb
+	s.indexers["libgen"] = bookComb.GetLibGen()
+	s.indexers["annas"] = bookComb.GetAnnasArchive()
 	s.logger.Info("📊 Indexers ready", zap.Int("count", len(s.indexers)))
+}
+
+// YTS handler
+func (s *Server) handleYTSSearch(c *gin.Context) {
+	query := c.Query("q")
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Query parameter 'q' is required"})
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "20")
+	var limit int
+	fmt.Sscanf(limitStr, "%d", &limit)
+
+	// Retrieve the indexer from the map
+	indexer, ok := s.indexers["YTS"]
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "YTS indexer not found"})
+		return
+	}
+
+	// Use context from request for cancellation/timeout
+	results, err := indexer.Search(c.Request.Context(), query, limit)
+	if err != nil {
+		s.logger.Error("YTS search failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"query":   query,
+		"count":   len(results),
+		"results": results,
+	})
 }
 
 // LibGen handler
@@ -498,35 +542,79 @@ func (s *Server) solveAnnasArchiveDownload(ctx context.Context, mirrorURL string
 		return "", fmt.Errorf("failed to solve challenge: %w", err)
 	}
 
-	// Extract the download link from the solved page
-	// Looking for: <a href="https://b4mcx2ml.net/d3/y/..." target="_blank">📚 Download now</a>
 	downloadURL := ""
-	doc.Find("a[target='_blank']").Each(func(i int, sel *goquery.Selection) {
-		href, exists := sel.Attr("href")
-		text := strings.TrimSpace(sel.Text())
 
-		// Check if this is the download link
-		if exists && (strings.Contains(text, "Download") || strings.Contains(text, "📚")) {
-			// Validate it's a real download URL (not a relative link)
-			if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") {
-				downloadURL = href
-				return
-			}
+	// First try: emoji + "Download now" + exclude jdownloader
+	doc.Find("a").EachWithBreak(func(i int, sel *goquery.Selection) bool {
+		href, exists := sel.Attr("href")
+		if !exists || !strings.HasPrefix(href, "https://") {
+			return true
 		}
+
+		text := strings.TrimSpace(sel.Text())
+		lowerText := strings.ToLower(text)
+		lowerHref := strings.ToLower(href)
+
+		if strings.Contains(lowerHref, "jdownloader") ||
+			strings.Contains(lowerText, "jdownloader") {
+			return true
+		}
+
+		// Prefer links with emoji or "Download now"
+		if (strings.Contains(text, "📚") ||
+			strings.Contains(lowerText, "download now")) &&
+			(strings.Contains(lowerHref, ".epub") ||
+				strings.Contains(lowerHref, ".pdf") ||
+				strings.Contains(lowerHref, "/annas-arch-") ||
+				strings.Contains(lowerHref, "/d3/") || strings.Contains(lowerHref, "/d4/")) {
+
+			downloadURL = href
+			return false // found → stop
+		}
+		return true
 	})
 
+	// Fallback: longest https link that looks file-ish and not jdownloader
 	if downloadURL == "" {
-		// Fallback: try to find any link containing the file extension
-		doc.Find("a[href*='.epub'], a[href*='.pdf'], a[href*='.mobi']").Each(func(i int, sel *goquery.Selection) {
-			if href, exists := sel.Attr("href"); exists {
-				if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") {
-					downloadURL = href
-					return
-				}
+		var best string
+		maxLen := 0
+
+		doc.Find("a[href^='https://']").Each(func(_ int, sel *goquery.Selection) {
+			href, _ := sel.Attr("href")
+			lower := strings.ToLower(href)
+
+			if strings.Contains(lower, "jdownloader") {
+				return
+			}
+
+			isLikelyFile := strings.Contains(lower, ".epub") ||
+				strings.Contains(lower, ".pdf") ||
+				strings.Contains(lower, ".azw3") ||
+				strings.Contains(lower, "/annas-arch-") ||
+				(strings.Contains(lower, "/d") && len(lower) > 120) // long CDN paths
+
+			if isLikelyFile && len(href) > maxLen {
+				best = href
+				maxLen = len(href)
 			}
 		})
+		if best != "" {
+			downloadURL = best
+		}
 	}
 
+	if downloadURL == "" {
+		// Debug helper: log part of the page
+		htmlStr, _ := doc.Html()
+		preview := htmlStr
+		if len(preview) > 1800 {
+			preview = preview[:1800]
+		}
+		s.logger.Warn("No good download link extracted",
+			zap.String("mirror", mirrorURL),
+			zap.String("page_preview", preview))
+		return "", fmt.Errorf("could not find real file link after bypass")
+	}
 	if downloadURL == "" {
 		return "", fmt.Errorf("download link not found in solved page")
 	}
@@ -821,6 +909,34 @@ func (s *Server) handleDODIPopular(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"results": results})
 	} else {
 		c.JSON(http.StatusNotFound, gin.H{"error": "DODI indexer not available"})
+	}
+}
+
+// handles for Books(all in One)
+// handles searches for both annas-archive and libgen
+func (s *Server) handleBooksSearch(c *gin.Context) {
+	query := c.Query("query")
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "query paramerter required"})
+		return
+	}
+	limit := 20
+	if l := c.Query("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+	}
+	if aggregator, ok := s.indexers["Books"].(*books.BookAggregator); ok {
+		results, err := aggregator.Search(c.Request.Context(), query, limit)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"query":   query,
+			"results": results,
+			"count":   len(results),
+		})
+	} else {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Repack aggregator not initialized"})
 	}
 }
 

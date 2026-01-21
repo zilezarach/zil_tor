@@ -14,6 +14,7 @@ type TorrentResult struct {
 	Category    string            `json:"category"`
 	Source      string            `json:"source"`
 	PublishDate time.Time         `json:"publish_date"`
+	UploadDate  time.Time         `json:"upload_date"`
 	Quality     string            `json:"quality,omitempty"`
 	Resolution  string            `json:"resolution,omitempty"`
 	Codec       string            `json:"codec,omitempty"`
