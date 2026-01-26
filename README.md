@@ -37,8 +37,8 @@ A high-performance, unified API for searching and downloading content from multi
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
-cd zil_tor-api
+git clone git@github.com:zilezarach/zil_tor.git
+cd zil_tor
 
 # Start everything
 docker-compose up -d
@@ -66,8 +66,8 @@ curl http://localhost:9117/api/v1/health
 
 ```bash
 # 1. Clone the repository
-git clone <your-repo-url>
-cd zil_tor-api
+git clone git@github.com:zilezarach/zil_tor.git
+cd zil_tor
 
 # 2. (Optional) Edit configuration in docker-compose.yml
 nano docker-compose.yml
@@ -675,23 +675,17 @@ const axios = require("axios");
 
 // 🔥 Unified search - searches both LibGen and Anna's Archive
 const searchBooks = async (query, limit = 25) => {
-  const response = await axios.get(
-    "http://localhost:9117/api/v1/books/search",
-    {
-      params: { query, limit },
-    },
-  );
+  const response = await axios.get("http://localhost:9117/api/v1/books/search", {
+    params: { query, limit }
+  });
   return response.data;
 };
 
 // Smart download - tries both sources automatically
 const downloadBook = async (md5, source = "auto") => {
-  const response = await axios.get(
-    "http://localhost:9117/api/v1/books/download",
-    {
-      params: { md5, source },
-    },
-  );
+  const response = await axios.get("http://localhost:9117/api/v1/books/download", {
+    params: { md5, source }
+  });
 
   console.log(`Source used: ${response.data.source}`);
   console.log(`Cached: ${response.data.cached}`);
@@ -711,9 +705,7 @@ const downloadBook = async (md5, source = "auto") => {
   // Display results
   results.results.slice(0, 5).forEach((book, i) => {
     console.log(`${i + 1}. ${book.title} by ${book.author || "Unknown"}`);
-    console.log(
-      `   Source: ${book.source}, Format: ${book.extension}, Size: ${book.size}`,
-    );
+    console.log(`   Source: ${book.source}, Format: ${book.extension}, Size: ${book.size}`);
   });
 
   // Download first book
@@ -730,24 +722,18 @@ const downloadBook = async (md5, source = "auto") => {
 
 ```javascript
 // Only LibGen (faster)
-const libgenOnly = async (query) => {
-  const response = await axios.get(
-    "http://localhost:9117/api/v1/books/search/source",
-    {
-      params: { query, source: "libgen", limit: 10 },
-    },
-  );
+const libgenOnly = async query => {
+  const response = await axios.get("http://localhost:9117/api/v1/books/search/source", {
+    params: { query, source: "libgen", limit: 10 }
+  });
   return response.data;
 };
 
 // Only Anna's Archive (more comprehensive)
-const annasOnly = async (query) => {
-  const response = await axios.get(
-    "http://localhost:9117/api/v1/books/search/source",
-    {
-      params: { query, source: "annas", limit: 10 },
-    },
-  );
+const annasOnly = async query => {
+  const response = await axios.get("http://localhost:9117/api/v1/books/search/source", {
+    params: { query, source: "annas", limit: 10 }
+  });
   return response.data;
 };
 ```
@@ -758,30 +744,24 @@ const annasOnly = async (query) => {
 const axios = require("axios");
 
 // Search books
-const searchBooks = async (query) => {
-  const response = await axios.get(
-    "http://localhost:9117/api/v1/books/libgen/search",
-    {
-      params: { query, limit: 10 },
-    },
-  );
+const searchBooks = async query => {
+  const response = await axios.get("http://localhost:9117/api/v1/books/libgen/search", {
+    params: { query, limit: 10 }
+  });
   return response.data;
 };
 
 // Download from Anna's Archive
-const downloadBook = async (md5) => {
-  const response = await axios.get(
-    "http://localhost:9117/api/v1/books/annas/download",
-    {
-      params: { md5 },
-    },
-  );
+const downloadBook = async md5 => {
+  const response = await axios.get("http://localhost:9117/api/v1/books/annas/download", {
+    params: { md5 }
+  });
   return response.data.download_url;
 };
 
 // Usage
 searchBooks("python programming").then(console.log);
-downloadBook("94c18bda57d811a59ef70c695ef28933").then((url) => {
+downloadBook("94c18bda57d811a59ef70c695ef28933").then(url => {
   console.log("Download URL:", url);
 });
 ```
@@ -1139,4 +1119,4 @@ If this project helped you, please give it a star on GitHub!
 
 ---
 
-**Made with ❤️ by zilezarach **
+**Made with ❤️ by zilezarach**
