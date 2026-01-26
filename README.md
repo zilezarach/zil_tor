@@ -101,8 +101,8 @@ docker run -d \
 ```bash
 # Install Go 1.21+
 # Clone repo
-git clone <your-repo-url>
-cd zil_tor-api
+git clone git@github.com:zilezarach/zil_tor.git
+cd zil_tor
 
 # Install dependencies
 go mod download
