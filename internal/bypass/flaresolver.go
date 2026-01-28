@@ -60,7 +60,7 @@ func NewFlareSolverrClient(endpoint string, logger *zap.Logger) *FlareSolverrCli
 	return &FlareSolverrClient{
 		endpoint: endpoint,
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
@@ -75,7 +75,7 @@ func (f *FlareSolverrClient) Solve(ctx context.Context, url string) (*Response, 
 	reqBody := FlareSolverrRequest{
 		Cmd:        "request.get",
 		URL:        url,
-		MaxTimeout: 45000, // Reduced from 60s
+		MaxTimeout: 60000,
 	}
 
 	jsonData, _ := json.Marshal(reqBody)

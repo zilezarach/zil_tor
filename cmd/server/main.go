@@ -86,7 +86,7 @@ func main() {
 		Addr:           ":" + config.Port,
 		Handler:        server.router,
 		ReadTimeout:    120 * time.Second,
-		WriteTimeout:   120 * time.Second,
+		WriteTimeout:   30 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
 
@@ -240,6 +240,8 @@ func (s *Server) RegisterIndexers(solverClient *bypass.HybridClient) {
 	s.indexers["annas"] = bookComb.GetAnnasArchive()
 	s.logger.Info("📊 Indexers ready", zap.Int("count", len(s.indexers)))
 }
+
+// HANDLERS
 
 // YTS handler
 func (s *Server) handleYTSSearch(c *gin.Context) {
@@ -688,7 +690,7 @@ func (s *Server) handleAnnasArchiveProxyDownload(c *gin.Context) {
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 0}
 	resp, err := client.Do(req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -697,6 +699,9 @@ func (s *Server) handleAnnasArchiveProxyDownload(c *gin.Context) {
 		return
 	}
 	defer resp.Body.Close()
+
+	rc := http.NewResponseController(c.Writer)
+	rc.SetWriteDeadline(time.Now().Add(60 * time.Minute))
 
 	if resp.StatusCode != http.StatusOK {
 		c.JSON(http.StatusBadGateway, gin.H{
