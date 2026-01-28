@@ -25,6 +25,7 @@ import (
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games/dodi"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games/fitgirl"
+	"github.com/zilezarach/zil_tor-api/internal/indexers/general/Ext"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/general/x1337"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/movies/yts"
 	"github.com/zilezarach/zil_tor-api/internal/logger"
@@ -206,6 +207,11 @@ func (s *Server) SetupRoutes() {
 		// YTS
 		movies.GET("/search", s.handleYTSSearch)
 	}
+	general := api.Group("/general")
+	{
+		// EXT
+		general.GET("/search/ext", s.handleEXTSearch)
+	}
 }
 
 func (s *Server) RegisterIndexers(solverClient *bypass.HybridClient) {
@@ -213,6 +219,8 @@ func (s *Server) RegisterIndexers(solverClient *bypass.HybridClient) {
 	s.logger.Info("YTS Indexers Loaded")
 	s.indexers["1337x"] = x1337.X1337GenIndexer(solverClient, s.logger)
 	s.logger.Info("1337x Indexers Loaded")
+	s.indexers["Ext"] = Ext.ExTGenIndexer(solverClient, s.logger)
+	s.logger.Info("ExT Indexers Loaded")
 	s.indexers["Fitgirl"] = fitgirl.FitgirlGenIndexer(solverClient, s.logger)
 	s.logger.Info("Fitgirl Indexers Loaded")
 	s.indexers["DODI"] = dodi.DODIGenIndexer(solverClient, s.logger)
@@ -1230,6 +1238,67 @@ func (s *Server) searchIndexers(ctx context.Context, query string, limit int, ca
 	}
 
 	return allResults
+}
+
+// Handler for EXT
+func (s *Server) handleEXTSearch(c *gin.Context) {
+	query := c.Query("query")
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "query parameter required", "example": "/ext/search?query=example"})
+		return
+	}
+	limit := 20
+	if l := c.Query("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+		if limit > 100 {
+			limit = 100
+		}
+	}
+	cacheKey := fmt.Sprintf("ext_search:%s:%d", query, limit)
+	if s.config.CacheEnabled {
+		if cached, found := s.cache.Get(cacheKey); found {
+			s.logger.Debug("EXT search cache hit", zap.String("query", query))
+			c.JSON(http.StatusOK, gin.H{
+				"query":   query,
+				"results": cached,
+				"cached":  true,
+				"source":  "EXT",
+			})
+			return
+		}
+		ExtIndexer, ok := s.indexers["Ext"]
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "EXT indexer not available"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+		defer cancel()
+		start := time.Now()
+		results, err := ExtIndexer.Search(ctx, query, limit)
+		searchTime := time.Since(start).Seconds() * 1000
+		if err != nil {
+			s.logger.Error("EXT search failed", zap.String("query", query), zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("EXT search failed: %v", err), "query": query})
+			return
+		}
+		if s.config.CacheEnabled && len(results) > 0 {
+			s.cache.Set(cacheKey, results)
+		}
+
+		s.logger.Info("Ext search complete",
+			zap.String("query", query),
+			zap.Int("results", len(results)),
+			zap.Float64("time_ms", searchTime))
+
+		c.JSON(http.StatusOK, gin.H{
+			"query":          query,
+			"results":        results,
+			"count":          len(results),
+			"search_time_ms": searchTime,
+			"source":         "EXT",
+			"cached":         false,
+		})
+	}
 }
 
 // Handlers for LibGen

@@ -21,6 +21,8 @@ type FlareSolverrClient struct {
 	endpoint   string
 	httpClient *http.Client
 	logger     *zap.Logger
+	sessionID  string
+	mu         sync.Mutex
 }
 
 type FlareSession struct {
@@ -150,6 +152,109 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 	return sc
 }
 
+func (f *FlareSolverrClient) CreateSession(ctx context.Context) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	reqBody := map[string]interface{}{
+		"cmd": "sessions.create",
+	}
+
+	jsonData, _ := json.Marshal(reqBody)
+	req, err := http.NewRequestWithContext(ctx, "POST", f.endpoint+"/v1", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+		Session string `json:"session"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	if result.Status != "ok" {
+		return "", fmt.Errorf("session creation failed: %s", result.Message)
+	}
+
+	f.sessionID = result.Session
+	f.logger.Info("FlareSolverr session created", zap.String("session_id", result.Session))
+	return result.Session, nil
+}
+
+// Update Solve to use session
+func (f *FlareSolverrClient) SolvePost(ctx context.Context, targetURL, postData string, headers map[string]string) (*Response, error) {
+	reqBody := map[string]interface{}{
+		"cmd":        "request.post",
+		"url":        targetURL,
+		"postData":   postData,
+		"maxTimeout": 45000,
+	}
+
+	// Add session if we have one
+	if f.sessionID != "" {
+		reqBody["session"] = f.sessionID
+	}
+
+	// Add headers if provided
+	if len(headers) > 0 {
+		reqBody["headers"] = headers
+	}
+
+	jsonData, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", f.endpoint+"/v1", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("flaresolverr request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var fsResp FlareSolverrResponse
+	if err := json.NewDecoder(resp.Body).Decode(&fsResp); err != nil {
+		return nil, fmt.Errorf("decode failed: %w", err)
+	}
+
+	if fsResp.Status != "ok" {
+		return nil, fmt.Errorf("flaresolverr error: %s", fsResp.Message)
+	}
+
+	cookies := make([]*Cookie, 0, len(fsResp.Solution.Cookies))
+	for _, c := range fsResp.Solution.Cookies {
+		cookies = append(cookies, &Cookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Domain:   c.Domain,
+			Path:     c.Path,
+			Expires:  time.Unix(int64(c.Expires), 0),
+			HttpOnly: c.HTTPOnly,
+			Secure:   c.Secure,
+		})
+	}
+
+	return &Response{
+		HTML:       fsResp.Solution.Response,
+		Cookies:    cookies,
+		UserAgent:  fsResp.Solution.UserAgent,
+		StatusCode: fsResp.Solution.Status,
+	}, nil
+}
+
 func (sc *SessionCache) cleanup() {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -197,8 +302,8 @@ func (sc *SessionCache) Set(urlStr string, cookies []*Cookie, userAgent string) 
 type HybridClient struct {
 	customClient   *Client
 	flareSolverr   *FlareSolverrClient
-	httpClient     *http.Client
-	sessionCache   *SessionCache
+	HttpClient     *http.Client
+	SessionCache   *SessionCache
 	useCustomFirst bool
 	logger         *zap.Logger
 
@@ -232,7 +337,7 @@ func NewHybridClient(customSolver *Solver, flareEndpoint string, logger *zap.Log
 	return &HybridClient{
 		customClient: customClient,
 		flareSolverr: flareSolverr,
-		httpClient: &http.Client{
+		HttpClient: &http.Client{
 			Timeout: 15 * time.Second,
 			Transport: &http.Transport{
 				MaxIdleConns:        200,
@@ -242,7 +347,7 @@ func NewHybridClient(customSolver *Solver, flareEndpoint string, logger *zap.Log
 				DisableKeepAlives:   false,
 			},
 		},
-		sessionCache:   NewSessionCache(30 * time.Minute),
+		SessionCache:   NewSessionCache(30 * time.Minute),
 		useCustomFirst: customSolver != nil,
 		logger:         logger,
 		inFlight:       make(map[string]*flightGroup),
@@ -299,7 +404,7 @@ func (h *HybridClient) Get(ctx context.Context, urlStr string) (*http.Response, 
 
 func (h *HybridClient) doGet(ctx context.Context, urlStr string) (*http.Response, error) {
 	// Fast path: Check session cache
-	if session, exists := h.sessionCache.Get(urlStr); exists {
+	if session, exists := h.SessionCache.Get(urlStr); exists {
 		resp, err := h.tryWithSession(ctx, urlStr, session)
 		if err == nil {
 			h.logger.Debug("✅ Session cache hit", zap.String("url", urlStr))
@@ -312,7 +417,7 @@ func (h *HybridClient) doGet(ctx context.Context, urlStr string) (*http.Response
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
-	resp, err := h.httpClient.Do(req)
+	resp, err := h.HttpClient.Do(req)
 	if err == nil && resp.StatusCode == 200 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -330,7 +435,7 @@ func (h *HybridClient) doGet(ctx context.Context, urlStr string) (*http.Response
 	if h.flareSolverr != nil {
 		solverResp, err := h.flareSolverr.Solve(ctx, urlStr)
 		if err == nil {
-			h.sessionCache.Set(urlStr, solverResp.Cookies, solverResp.UserAgent)
+			h.SessionCache.Set(urlStr, solverResp.Cookies, solverResp.UserAgent)
 			return createHTTPResponse(solverResp), nil
 		}
 		h.logger.Warn("FlareSolverr failed", zap.Error(err))
@@ -347,6 +452,120 @@ func (h *HybridClient) doGet(ctx context.Context, urlStr string) (*http.Response
 	return nil, fmt.Errorf("all solvers failed")
 }
 
+func (h *HybridClient) Post(ctx context.Context, urlStr string, body io.Reader, headers map[string]string) (*http.Response, error) {
+	// Read body for potential reuse
+	var bodyBytes []byte
+	if body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read body: %w", err)
+		}
+	}
+
+	// Try with cached session first
+	if session, exists := h.SessionCache.Get(urlStr); exists {
+		resp, err := h.tryPostWithSession(ctx, urlStr, bodyBytes, headers, session)
+		if err == nil {
+			h.logger.Debug("✅ POST with cached session succeeded", zap.String("url", urlStr))
+			return resp, nil
+		}
+		h.logger.Debug("Cached session failed for POST, will use FlareSolverr", zap.Error(err))
+	}
+
+	// Create request for direct attempt
+	req, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	// Default headers
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "*/*")
+
+	// Add custom headers
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	// Try direct POST first
+	resp, err := h.HttpClient.Do(req)
+	if err == nil && resp.StatusCode == 200 {
+		respBodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		respStr := string(respBodyBytes)
+		// Check for both Cloudflare challenge AND invalid session
+		if !isCloudflareChallenge(respStr) && !strings.Contains(respStr, "Invalid session") {
+			resp.Body = io.NopCloser(bytes.NewReader(respBodyBytes))
+			return resp, nil
+		}
+		h.logger.Debug("Direct POST blocked or invalid session", zap.String("response_preview", respStr[:min(200, len(respStr))]))
+	}
+
+	// Use FlareSolverr for POST
+	if h.flareSolverr != nil {
+		h.logger.Debug("Using FlareSolverr for POST", zap.String("url", urlStr))
+
+		solverResp, err := h.flareSolverr.SolvePost(ctx, urlStr, string(bodyBytes), headers)
+		if err == nil {
+			h.SessionCache.Set(urlStr, solverResp.Cookies, solverResp.UserAgent)
+			return createHTTPResponse(solverResp), nil
+		}
+		h.logger.Warn("FlareSolverr POST failed", zap.Error(err))
+	}
+
+	return nil, fmt.Errorf("all solvers failed for POST")
+}
+
+// Add this helper method to HybridClient
+func (h *HybridClient) tryPostWithSession(ctx context.Context, urlStr string, bodyBytes []byte, headers map[string]string, session *CachedSession) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	// Use session user agent
+	req.Header.Set("User-Agent", session.UserAgent)
+
+	// Add custom headers
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	// Add session cookies
+	for _, cookie := range session.Cookies {
+		req.AddCookie(&http.Cookie{
+			Name:  cookie.Name,
+			Value: cookie.Value,
+		})
+	}
+
+	resp, err := h.HttpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	respBodyBytes, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	respStr := string(respBodyBytes)
+	if isCloudflareChallenge(respStr) || strings.Contains(respStr, "Invalid session") {
+		return nil, fmt.Errorf("session expired or invalid")
+	}
+
+	resp.Body = io.NopCloser(bytes.NewReader(respBodyBytes))
+	return resp, nil
+}
+
 func (h *HybridClient) tryWithSession(ctx context.Context, urlStr string, session *CachedSession) (*http.Response, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
 	req.Header.Set("User-Agent", session.UserAgent)
@@ -358,7 +577,7 @@ func (h *HybridClient) tryWithSession(ctx context.Context, urlStr string, sessio
 		})
 	}
 
-	resp, err := h.httpClient.Do(req)
+	resp, err := h.HttpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -406,7 +625,7 @@ func (h *HybridClient) GetWithFlareSolverr(ctx context.Context, url string) (*ht
 		return nil, err
 	}
 
-	h.sessionCache.Set(url, solverResp.Cookies, solverResp.UserAgent)
+	h.SessionCache.Set(url, solverResp.Cookies, solverResp.UserAgent)
 	return createHTTPResponse(solverResp), nil
 }
 
