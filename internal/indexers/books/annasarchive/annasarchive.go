@@ -152,14 +152,16 @@ func (a *AnnasArchiveIndexer) Search(ctx context.Context, query string, limit in
 
 // buildSearchURL constructs the search URL with parameters
 func (a *AnnasArchiveIndexer) buildSearchURL(query, content, sort, fileType string, enableFilters bool) string {
-	query = strings.ReplaceAll(query, " ", "+")
+	// url.QueryEscape is safer than manual string replacement for special characters
+	escapedQuery := url.QueryEscape(query)
 
 	if !enableFilters {
-		return fmt.Sprintf("%s/search?q=%s", a.baseURL, query)
+		return fmt.Sprintf("%s/search?q=%s", a.baseURL, escapedQuery)
 	}
 
-	return fmt.Sprintf("%s/search?index=&q=%s&content=%s&ext=%s&sort=%s",
-		a.baseURL, query, content, fileType, sort)
+	// Explicitly adding page=1 and display= as seen in your target URL
+	return fmt.Sprintf("%s/search?index=&page=1&sort=%s&display=&q=%s&content=%s&ext=%s",
+		a.baseURL, sort, escapedQuery, content, fileType)
 }
 
 // parseSearchResults extracts book entries from search results HTML
