@@ -25,6 +25,7 @@ import (
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games/dodi"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/games/fitgirl"
+	"github.com/zilezarach/zil_tor-api/internal/indexers/general"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/general/Ext"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/general/x1337"
 	"github.com/zilezarach/zil_tor-api/internal/indexers/movies/yts"
@@ -170,7 +171,7 @@ func NewServer(config *Config, logger *zap.Logger) *Server {
 func (s *Server) SetupRoutes() {
 	api := s.router.Group("/api/v1")
 	{
-		api.GET("/search", s.handleSearch)
+		api.GET("/search", s.handleGeneralIndexers)
 		api.GET("/indexers", s.handleIndexers)
 		api.GET("/health", s.handleHealth)
 		api.GET("/stats", s.handleStats)
@@ -209,6 +210,8 @@ func (s *Server) SetupRoutes() {
 	}
 	general := api.Group("/general")
 	{
+		// Aggregator
+		general.GET("/search", s.handleGeneralIndexers)
 		// EXT
 		general.GET("/search/ext", s.handleEXTSearch)
 	}
@@ -221,6 +224,7 @@ func (s *Server) RegisterIndexers(solverClient *bypass.HybridClient) {
 	s.logger.Info("1337x Indexers Loaded")
 	s.indexers["Ext"] = Ext.ExTGenIndexer(solverClient, s.logger)
 	s.logger.Info("ExT Indexers Loaded")
+	s.indexers["General"] = general.NewGeneralAggregator(solverClient, s.logger)
 	s.indexers["Fitgirl"] = fitgirl.FitgirlGenIndexer(solverClient, s.logger)
 	s.logger.Info("Fitgirl Indexers Loaded")
 	s.indexers["DODI"] = dodi.DODIGenIndexer(solverClient, s.logger)
@@ -245,7 +249,7 @@ func (s *Server) RegisterIndexers(solverClient *bypass.HybridClient) {
 
 // YTS handler
 func (s *Server) handleYTSSearch(c *gin.Context) {
-	query := c.Query("q")
+	query := c.Query("query")
 	if query == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Query parameter 'q' is required"})
 		return
@@ -985,6 +989,33 @@ func (s *Server) handleBooksSearch(c *gin.Context) {
 		})
 	} else {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Repack aggregator not initialized"})
+	}
+}
+
+// handle General Indexers i.e x1337, EXT
+func (s *Server) handleGeneralIndexers(c *gin.Context) {
+	query := c.Query("query")
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "query parameter required"})
+		return
+	}
+	limit := 20
+	if l := c.Query("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+	}
+	if aggregator, ok := s.indexers["General"].(*general.GeneralAggregator); ok {
+		results, err := aggregator.Search(c.Request.Context(), query, limit)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"query":   query,
+			"results": results,
+			"count":   len(results),
+		})
+	} else {
+		c.JSON(http.StatusNotFound, gin.H{"error": "General Indexers Ga"})
 	}
 }
 

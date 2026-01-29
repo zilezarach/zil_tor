@@ -52,7 +52,7 @@ func ExTGenIndexer(client *bypass.HybridClient, logger *zap.Logger) *ExTIndexer 
 }
 
 func (idx *ExTIndexer) Search(ctx context.Context, query string, limit int) ([]models.TorrentResult, error) {
-	searchURL := fmt.Sprintf("%s/browse/?q=%s&with_adult=1", idx.apiURL, url.QueryEscape(query))
+	searchURL := fmt.Sprintf("%s/browse/?q=%s&with_adult=0", idx.apiURL, url.QueryEscape(query))
 	idx.logger.Info("Searching the ExT index", zap.String("url", searchURL))
 	resp, err := idx.client.Get(ctx, searchURL)
 	if err != nil {
